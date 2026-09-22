@@ -1,1 +1,1357 @@
+import os
+import re
+import json
+import hashlib
+import requests
+import streamlit as st
 
+from datetime import datetime
+from collections import Counter
+from pypdf import PdfReader
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
+
+
+# ============================================================
+# 1. LOAD ENVIRONMENT VARIABLES
+# ============================================================
+
+load_dotenv()
+
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "qwen2.5:3b"
+
+CHAT_DIR = "chats"
+
+os.makedirs(CHAT_DIR, exist_ok=True)
+
+
+# ============================================================
+# 2. PAGE CONFIGURATION
+# ============================================================
+
+st.set_page_config(
+    page_title="Graph RAG - Surya",
+    page_icon="🧠",
+    layout="wide"
+)
+
+
+# ============================================================
+# 3. CUSTOM CSS
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+    .user-msg {
+        background-color: #2b313e;
+        padding: 12px;
+        border-radius: 10px;
+        margin-bottom: 10px;
+    }
+
+    .bot-msg {
+        background-color: #1e1e1e;
+        padding: 12px;
+        border-radius: 10px;
+        margin-bottom: 10px;
+    }
+
+    .sidebar-section {
+        margin-top: 15px;
+        font-size: 13px;
+        opacity: 0.7;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# 4. NEO4J CONNECTION
+# ============================================================
+
+@st.cache_resource
+def get_neo4j_driver():
+    """
+    Create and cache the Neo4j driver.
+    """
+
+    if not NEO4J_URI:
+        raise ValueError("NEO4J_URI is missing in the .env file.")
+
+    if not NEO4J_USERNAME:
+        raise ValueError(
+            "NEO4J_USERNAME is missing in the .env file."
+        )
+
+    if not NEO4J_PASSWORD:
+        raise ValueError(
+            "NEO4J_PASSWORD is missing in the .env file."
+        )
+
+    driver = GraphDatabase.driver(
+        NEO4J_URI,
+        auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+    )
+
+    driver.verify_connectivity()
+
+    return driver
+
+
+# ============================================================
+# 5. CREATE NEO4J CONSTRAINTS
+# ============================================================
+
+def create_constraints(driver):
+    """
+    Create uniqueness constraints.
+    """
+
+    queries = [
+        """
+        CREATE CONSTRAINT document_name_unique IF NOT EXISTS
+        FOR (d:Document)
+        REQUIRE d.name IS UNIQUE
+        """,
+        """
+        CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS
+        FOR (c:Chunk)
+        REQUIRE c.id IS UNIQUE
+        """,
+        """
+        CREATE CONSTRAINT entity_key_unique IF NOT EXISTS
+        FOR (e:Entity)
+        REQUIRE e.key IS UNIQUE
+        """
+    ]
+
+    with driver.session() as session:
+        for query in queries:
+            session.run(query)
+
+
+# ============================================================
+# 6. PDF TEXT EXTRACTION
+# ============================================================
+
+def extract_pdf_text(uploaded_file):
+    """
+    Extract text from every page of the uploaded PDF.
+    """
+
+    reader = PdfReader(uploaded_file)
+
+    pages = []
+
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+
+        if text.strip():
+            pages.append(
+                {
+                    "page": page_number,
+                    "text": text
+                }
+            )
+
+    return pages
+
+
+# ============================================================
+# 7. TEXT CLEANING
+# ============================================================
+
+def clean_text(text):
+    """
+    Clean unnecessary spaces and null characters.
+    """
+
+    if not text:
+        return ""
+
+    text = text.replace("\x00", " ")
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+# ============================================================
+# 8. TEXT CHUNKING
+# ============================================================
+
+def split_text_into_chunks(
+    text,
+    chunk_size=1200,
+    overlap=200
+):
+    """
+    Split text into overlapping chunks.
+    """
+
+    text = clean_text(text)
+
+    if not text:
+        return []
+
+    if overlap >= chunk_size:
+        overlap = 100
+
+    chunks = []
+
+    start = 0
+    text_length = len(text)
+
+    while start < text_length:
+        end = min(start + chunk_size, text_length)
+
+        chunk = text[start:end].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= text_length:
+            break
+
+        start = end - overlap
+
+    return chunks
+
+
+# ============================================================
+# 9. ENTITY EXTRACTION
+# ============================================================
+
+def extract_entities(text):
+    """
+    Basic keyword/entity extraction.
+
+    This is a lightweight method. It is not a full NLP model,
+    but it is useful for demonstrating Graph RAG.
+    """
+
+    stop_words = {
+        "about", "after", "again", "against", "also", "among",
+        "because", "before", "being", "between", "could",
+        "from", "have", "into", "more", "other", "over",
+        "such", "than", "that", "their", "there", "these",
+        "they", "this", "those", "through", "under", "were",
+        "which", "while", "with", "would", "where", "when",
+        "what", "whose", "will", "your", "ours", "some",
+        "many", "much", "very", "only", "each", "both",
+        "them", "then", "here", "been", "does", "done",
+        "is", "are", "was", "and", "the", "for",
+        "you", "not", "but", "can", "has", "had", "its",
+        "our", "out", "all", "any", "how", "who", "why",
+        "a", "an", "in", "of", "to", "on", "or", "as",
+        "by", "it", "at", "be", "we", "he", "she", "i",
+        "may", "might", "must", "shall", "should", "will",
+        "than", "also", "however", "therefore", "thus",
+        "into", "upon", "per", "one", "two", "three"
+    }
+
+    words = re.findall(
+        r"\b[a-zA-Z][a-zA-Z-]{2,}\b",
+        text.lower()
+    )
+
+    word_counts = Counter(words)
+
+    entities = []
+
+    for word, count in word_counts.items():
+        if word in stop_words:
+            continue
+
+        if len(word) < 4:
+            continue
+
+        # Keep repeated words or longer conceptual words
+        if count >= 2 or len(word) >= 7:
+            entities.append(
+                {
+                    "name": word,
+                    "type": "Concept"
+                }
+            )
+
+    # Keep a maximum of 40 entities per chunk
+    entities = entities[:40]
+
+    return entities
+
+
+# ============================================================
+# 10. CREATE ENTITY RELATIONSHIPS
+# ============================================================
+
+def create_entity_relationships(entities):
+    """
+    Create simple relationships between entities appearing
+    in the same chunk.
+    """
+
+    relationships = []
+
+    # Limit relationship creation to avoid too many edges
+    limited_entities = entities[:15]
+
+    for i in range(len(limited_entities)):
+        for j in range(i + 1, len(limited_entities)):
+            source = limited_entities[i]["name"]
+            target = limited_entities[j]["name"]
+
+            if source != target:
+                relationships.append(
+                    {
+                        "source": source,
+                        "target": target,
+                        "type": "RELATED_TO"
+                    }
+                )
+
+    return relationships
+
+
+# ============================================================
+# 11. DELETE EXISTING DOCUMENT DATA
+# ============================================================
+
+def delete_existing_document(driver, document_name):
+    """
+    Delete the old document, chunks, and their relationships
+    before rebuilding the same PDF.
+
+    This avoids duplicate or outdated chunks.
+    """
+
+    with driver.session() as session:
+        session.run(
+            """
+            MATCH (d:Document {name: $document_name})
+            OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
+            DETACH DELETE d, c
+            """,
+            document_name=document_name
+        )
+
+
+# ============================================================
+# 12. INSERT PDF INTO NEO4J
+# ============================================================
+
+def insert_pdf_into_graph(
+    driver,
+    document_name,
+    pages
+):
+    """
+    Insert:
+    Document -> Chunk -> Entity
+
+    Also create RELATED_TO relationships between entities.
+    """
+
+    document_hash = hashlib.md5(
+        document_name.encode("utf-8")
+    ).hexdigest()[:12]
+
+    # Remove old version of the same document
+    delete_existing_document(
+        driver,
+        document_name
+    )
+
+    with driver.session() as session:
+
+        # ----------------------------------------------------
+        # CREATE DOCUMENT
+        # ----------------------------------------------------
+
+        session.run(
+            """
+            MERGE (d:Document {name: $name})
+            SET d.document_id = $document_id,
+                d.updated_at = datetime()
+            """,
+            name=document_name,
+            document_id=document_hash
+        )
+
+        chunk_number = 0
+
+        # ----------------------------------------------------
+        # PROCESS EACH PAGE
+        # ----------------------------------------------------
+
+        for page_data in pages:
+
+            page_number = page_data["page"]
+            page_text = page_data["text"]
+
+            chunks = split_text_into_chunks(page_text)
+
+            for chunk_text in chunks:
+
+                chunk_number += 1
+
+                chunk_id = (
+                    f"{document_hash}_"
+                    f"page_{page_number}_"
+                    f"chunk_{chunk_number}"
+                )
+
+                # ------------------------------------------------
+                # CREATE CHUNK AND DOCUMENT RELATIONSHIP
+                # ------------------------------------------------
+
+                session.run(
+                    """
+                    MERGE (c:Chunk {id: $chunk_id})
+                    SET c.text = $text,
+                        c.page = $page,
+                        c.document_name = $document_name
+
+                    WITH c
+                    MATCH (d:Document {name: $document_name})
+
+                    MERGE (d)-[:HAS_CHUNK]->(c)
+                    """,
+                    chunk_id=chunk_id,
+                    text=chunk_text,
+                    page=page_number,
+                    document_name=document_name
+                )
+
+                # ------------------------------------------------
+                # EXTRACT ENTITIES
+                # ------------------------------------------------
+
+                entities = extract_entities(chunk_text)
+
+                # ------------------------------------------------
+                # CREATE ENTITY NODES AND MENTIONS RELATIONSHIPS
+                # ------------------------------------------------
+
+                for entity in entities:
+
+                    entity_name = entity["name"]
+                    entity_type = entity["type"]
+                    entity_key = entity_name.lower().strip()
+
+                    session.run(
+                        """
+                        MERGE (e:Entity {key: $entity_key})
+                        SET e.name = $entity_name,
+                            e.type = $entity_type
+
+                        WITH e
+                        MATCH (c:Chunk {id: $chunk_id})
+
+                        MERGE (c)-[:MENTIONS]->(e)
+                        """,
+                        entity_key=entity_key,
+                        entity_name=entity_name,
+                        entity_type=entity_type,
+                        chunk_id=chunk_id
+                    )
+
+                # ------------------------------------------------
+                # CREATE ENTITY RELATIONSHIPS
+                # ------------------------------------------------
+
+                relationships = create_entity_relationships(
+                    entities
+                )
+
+                for relationship in relationships:
+
+                    source_key = relationship["source"].lower()
+                    target_key = relationship["target"].lower()
+
+                    session.run(
+                        """
+                        MATCH (a:Entity {key: $source_key})
+                        MATCH (b:Entity {key: $target_key})
+
+                        MERGE (a)-[:RELATED_TO]->(b)
+                        """,
+                        source_key=source_key,
+                        target_key=target_key
+                    )
+
+    return chunk_number
+
+
+# ============================================================
+# 13. QUERY KEYWORD EXTRACTION
+# ============================================================
+
+def extract_query_keywords(query):
+    """
+    Extract useful words from the user's question.
+    """
+
+    stop_words = {
+        "what", "which", "where", "when", "why", "how",
+        "is", "are", "was", "were", "the", "a", "an",
+        "and", "or", "to", "of", "in", "on", "for",
+        "from", "with", "about", "tell", "me", "please",
+        "can", "you", "does", "do", "i", "my", "we",
+        "this", "that", "it", "be", "has", "have",
+        "explain", "give", "brief", "briefly", "describe",
+        "difference", "between", "relation", "relationship",
+        "pdf", "document", "say", "said", "would", "could",
+        "should", "please"
+    }
+
+    words = re.findall(
+        r"\b[a-zA-Z][a-zA-Z-]{2,}\b",
+        query.lower()
+    )
+
+    keywords = [
+        word for word in words
+        if word not in stop_words
+    ]
+
+    # Remove duplicate keywords while preserving order
+    unique_keywords = list(dict.fromkeys(keywords))
+
+    return unique_keywords
+
+
+# ============================================================
+# 14. GENERAL QUESTION DETECTION
+# ============================================================
+
+def is_greeting(query):
+    """
+    Detect greetings.
+    """
+
+    greeting_words = {
+        "hi",
+        "hii",
+        "hiii",
+        "hiiii",
+        "hello",
+        "hey",
+        "hai",
+        "good morning",
+        "good afternoon",
+        "good evening"
+    }
+
+    cleaned = query.lower().strip()
+
+    return cleaned in greeting_words
+
+
+def is_summary_question(query):
+    """
+    Detect questions asking for a general PDF summary.
+    """
+
+    summary_terms = [
+        "summarize",
+        "summary",
+        "brief explanation",
+        "briefly explain",
+        "explain the pdf",
+        "about the pdf",
+        "describe the pdf",
+        "main topics",
+        "overview of the pdf",
+        "what is this pdf about",
+        "what does the pdf discuss"
+    ]
+
+    cleaned = query.lower().strip()
+
+    return any(
+        term in cleaned
+        for term in summary_terms
+    )
+
+
+# ============================================================
+# 15. GRAPH RETRIEVAL
+# ============================================================
+
+def retrieve_from_graph(
+    driver,
+    query,
+    limit=8
+):
+    """
+    Retrieve relevant chunks using:
+
+    1. Direct keyword matching in chunk text
+    2. Entity matching through the graph
+    3. Fallback chunks for general questions
+    """
+
+    keywords = extract_query_keywords(query)
+
+    retrieved_chunks = {}
+
+    with driver.session() as session:
+
+        # ----------------------------------------------------
+        # METHOD 1: DIRECT TEXT SEARCH
+        # ----------------------------------------------------
+
+        for keyword in keywords:
+
+            result = session.run(
+                """
+                MATCH (c:Chunk)
+                WHERE toLower(c.text) CONTAINS $keyword
+
+                RETURN c.id AS chunk_id,
+                       c.text AS text,
+                       c.page AS page,
+                       c.document_name AS document_name
+
+                LIMIT $limit
+                """,
+                keyword=keyword.lower(),
+                limit=limit
+            )
+
+            for record in result:
+
+                chunk_id = record["chunk_id"]
+
+                if chunk_id not in retrieved_chunks:
+                    retrieved_chunks[chunk_id] = {
+                        "chunk_id": chunk_id,
+                        "text": record["text"],
+                        "page": record["page"],
+                        "document_name": record["document_name"],
+                        "entities": []
+                    }
+
+        # ----------------------------------------------------
+        # METHOD 2: ENTITY-BASED GRAPH SEARCH
+        # ----------------------------------------------------
+
+        for keyword in keywords:
+
+            result = session.run(
+                """
+                MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)
+                WHERE toLower(e.name) CONTAINS $keyword
+
+                OPTIONAL MATCH (c)-[:MENTIONS]->(related:Entity)
+
+                RETURN c.id AS chunk_id,
+                       c.text AS text,
+                       c.page AS page,
+                       c.document_name AS document_name,
+                       collect(DISTINCT related.name) AS entities
+
+                LIMIT $limit
+                """,
+                keyword=keyword.lower(),
+                limit=limit
+            )
+
+            for record in result:
+
+                chunk_id = record["chunk_id"]
+
+                if chunk_id not in retrieved_chunks:
+                    retrieved_chunks[chunk_id] = {
+                        "chunk_id": chunk_id,
+                        "text": record["text"],
+                        "page": record["page"],
+                        "document_name": record["document_name"],
+                        "entities": record["entities"] or []
+                    }
+                else:
+                    existing_entities = retrieved_chunks[
+                        chunk_id
+                    ].get("entities", [])
+
+                    new_entities = record["entities"] or []
+
+                    retrieved_chunks[chunk_id]["entities"] = list(
+                        dict.fromkeys(
+                            existing_entities + new_entities
+                        )
+                    )
+
+        # ----------------------------------------------------
+        # METHOD 3: GENERAL QUESTION FALLBACK
+        # ----------------------------------------------------
+
+        if not retrieved_chunks:
+
+            result = session.run(
+                """
+                MATCH (c:Chunk)
+                RETURN c.id AS chunk_id,
+                       c.text AS text,
+                       c.page AS page,
+                       c.document_name AS document_name
+
+                ORDER BY c.document_name, c.page, c.id
+
+                LIMIT $limit
+                """,
+                limit=limit
+            )
+
+            for record in result:
+
+                chunk_id = record["chunk_id"]
+
+                retrieved_chunks[chunk_id] = {
+                    "chunk_id": chunk_id,
+                    "text": record["text"],
+                    "page": record["page"],
+                    "document_name": record["document_name"],
+                    "entities": []
+                }
+
+    return list(retrieved_chunks.values())[:limit]
+
+
+# ============================================================
+# 16. RETRIEVE DOCUMENT SUMMARY CONTEXT
+# ============================================================
+
+def retrieve_summary_context(driver, limit=10):
+    """
+    Retrieve the first chunks from each uploaded document
+    for general PDF-summary questions.
+    """
+
+    summary_chunks = []
+
+    with driver.session() as session:
+
+        result = session.run(
+            """
+            MATCH (c:Chunk)
+            RETURN c.id AS chunk_id,
+                   c.text AS text,
+                   c.page AS page,
+                   c.document_name AS document_name
+
+            ORDER BY c.document_name, c.page, c.id
+
+            LIMIT $limit
+            """,
+            limit=limit
+        )
+
+        for record in result:
+            summary_chunks.append(
+                {
+                    "chunk_id": record["chunk_id"],
+                    "text": record["text"],
+                    "page": record["page"],
+                    "document_name": record["document_name"],
+                    "entities": []
+                }
+            )
+
+    return summary_chunks
+
+
+# ============================================================
+# 17. PREPARE CONTEXT
+# ============================================================
+
+def prepare_context(retrieved_chunks):
+    """
+    Convert retrieved chunks into context for Ollama.
+    """
+
+    if not retrieved_chunks:
+        return "No relevant information was found."
+
+    context_parts = []
+
+    for index, chunk in enumerate(
+        retrieved_chunks,
+        start=1
+    ):
+
+        entities = chunk.get("entities", [])
+
+        entity_text = (
+            ", ".join(entities)
+            if entities
+            else "Not available"
+        )
+
+        context_parts.append(
+            f"[Source {index}]\n"
+            f"Document: {chunk.get('document_name', 'Unknown')}\n"
+            f"Page: {chunk.get('page', 'Unknown')}\n"
+            f"Entities: {entity_text}\n"
+            f"Text: {chunk.get('text', '')}"
+        )
+
+    return "\n\n".join(context_parts)
+
+
+# ============================================================
+# 18. GENERATE ANSWER USING OLLAMA
+# ============================================================
+
+def generate_answer(query, context):
+    """
+    Generate an answer using the local Ollama model.
+    """
+
+    prompt = f"""
+You are a helpful assistant for a PDF Graph RAG application.
+
+Answer the user's question using only the retrieved PDF context.
+
+Rules:
+1. Use only the provided context.
+2. Do not invent information.
+3. Answer in simple, clear English.
+4. If the question asks for a difference, explain both sides
+   and then clearly state the differences.
+5. If the question asks about a relationship, explain how
+   the concepts are connected.
+6. If the context does not contain the answer, say:
+   "The answer is not available in the uploaded PDF."
+7. For a summary question, provide a short overview using
+   the available context.
+8. Mention the document name and page number when possible.
+9. Do not say that you searched Neo4j or used Graph RAG.
+10. Do not create unsupported facts.
+
+Retrieved PDF context:
+--------------------------------------------------
+{context}
+--------------------------------------------------
+
+User question:
+{query}
+
+Answer:
+"""
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2
+        }
+    }
+
+    try:
+
+        response = requests.post(
+            OLLAMA_URL,
+            json=payload,
+            timeout=180
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        answer = data.get("response", "").strip()
+
+        if not answer:
+            return "No answer was generated by Ollama."
+
+        return answer
+
+    except requests.exceptions.ConnectionError:
+
+        return (
+            "❌ Cannot connect to Ollama. "
+            "Please make sure Ollama is running."
+        )
+
+    except requests.exceptions.Timeout:
+
+        return (
+            "❌ Ollama took too long to respond. "
+            "Please try again."
+        )
+
+    except Exception as error:
+
+        return f"❌ Error generating answer: {error}"
+
+
+# ============================================================
+# 19. COMPLETE GRAPH RAG PIPELINE
+# ============================================================
+
+def graph_rag(driver, query):
+    """
+    Complete retrieval and generation pipeline.
+    """
+
+    if is_greeting(query):
+        return (
+            "Hello! 👋 I am your PDF Graph RAG assistant. "
+            "Ask me a question about the uploaded PDF.",
+            []
+        )
+
+    if is_summary_question(query):
+        retrieved_chunks = retrieve_summary_context(
+            driver,
+            limit=10
+        )
+    else:
+        retrieved_chunks = retrieve_from_graph(
+            driver,
+            query,
+            limit=8
+        )
+
+    if not retrieved_chunks:
+        return (
+            "The answer is not available in the uploaded PDF.",
+            []
+        )
+
+    context = prepare_context(retrieved_chunks)
+
+    answer = generate_answer(
+        query,
+        context
+    )
+
+    return answer, retrieved_chunks
+
+
+# ============================================================
+# 20. CHAT HELPERS
+# ============================================================
+
+def save_chat(messages):
+    """
+    Save chat messages as JSON.
+    """
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S_%f"
+    )
+
+    filename = f"chat_{timestamp}.json"
+
+    filepath = os.path.join(
+        CHAT_DIR,
+        filename
+    )
+
+    with open(
+        filepath,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            messages,
+            file,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+def load_old_chats():
+    """
+    Load previously saved chats.
+    """
+
+    chats = {}
+
+    for filename in os.listdir(CHAT_DIR):
+
+        if not filename.endswith(".json"):
+            continue
+
+        filepath = os.path.join(
+            CHAT_DIR,
+            filename
+        )
+
+        try:
+
+            with open(
+                filepath,
+                "r",
+                encoding="utf-8"
+            ) as file:
+
+                chats[filename] = json.load(file)
+
+        except Exception:
+            continue
+
+    return chats
+
+
+def get_chat_headline(messages):
+    """
+    Get a short title from the first user message.
+    """
+
+    for message in messages:
+
+        if message.get("role") == "user":
+
+            text = message.get(
+                "content",
+                ""
+            ).strip().replace("\n", " ")
+
+            if len(text) > 45:
+                return text[:45] + "..."
+
+            return text
+
+    return "New chat"
+
+
+# ============================================================
+# 21. SESSION STATE
+# ============================================================
+
+if "messages" not in st.session_state:
+
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": (
+                "Upload one or more PDFs, build the graph, "
+                "and ask me a question 📄🧠"
+            )
+        }
+    ]
+
+
+if "active_chat" not in st.session_state:
+    st.session_state.active_chat = None
+
+
+if "graph_ready" not in st.session_state:
+    st.session_state.graph_ready = False
+
+
+# ============================================================
+# 22. SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.markdown("## 🤖 Graph RAG with Surya")
+
+    st.markdown("### 📄 Upload PDFs")
+
+    uploaded_files = st.file_uploader(
+        "Upload one or more PDFs",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
+
+    if uploaded_files:
+
+        st.info(
+            f"{len(uploaded_files)} PDF file(s) selected"
+        )
+
+        if st.button(
+            "🧠 Build Knowledge Graph",
+            use_container_width=True
+        ):
+
+            try:
+
+                driver = get_neo4j_driver()
+
+                create_constraints(driver)
+
+                progress = st.progress(0)
+                status = st.empty()
+
+                total_files = len(uploaded_files)
+                total_chunks = 0
+
+                for index, uploaded_file in enumerate(
+                    uploaded_files,
+                    start=1
+                ):
+
+                    status.info(
+                        f"Processing {uploaded_file.name}..."
+                    )
+
+                    pages = extract_pdf_text(
+                        uploaded_file
+                    )
+
+                    if not pages:
+
+                        st.warning(
+                            f"⚠️ No text found in "
+                            f"{uploaded_file.name}. "
+                            f"It may be a scanned PDF."
+                        )
+
+                        progress.progress(
+                            index / total_files
+                        )
+
+                        continue
+
+                    chunk_count = insert_pdf_into_graph(
+                        driver=driver,
+                        document_name=uploaded_file.name,
+                        pages=pages
+                    )
+
+                    total_chunks += chunk_count
+
+                    st.success(
+                        f"✅ {uploaded_file.name}: "
+                        f"{chunk_count} chunks added"
+                    )
+
+                    progress.progress(
+                        index / total_files
+                    )
+
+                st.session_state.graph_ready = True
+
+                status.success(
+                    f"✅ Knowledge graph built successfully! "
+                    f"Total chunks: {total_chunks}"
+                )
+
+            except Exception as error:
+
+                st.error(
+                    f"❌ Graph building failed: {error}"
+                )
+
+    st.markdown(
+        "<div class='sidebar-section'>Your chats</div>",
+        unsafe_allow_html=True
+    )
+
+    old_chats = load_old_chats()
+
+    if not old_chats:
+
+        st.caption("No chats yet")
+
+    else:
+
+        for filename, messages in sorted(
+            old_chats.items(),
+            reverse=True
+        ):
+
+            title = get_chat_headline(messages)
+
+            is_active = (
+                st.session_state.active_chat == filename
+            )
+
+            if st.button(
+                title,
+                key=f"chat_{filename}",
+                use_container_width=True,
+                type=(
+                    "primary"
+                    if is_active
+                    else "secondary"
+                )
+            ):
+
+                st.session_state.active_chat = filename
+                st.session_state.messages = messages
+
+                st.rerun()
+
+    st.markdown("---")
+
+    st.markdown("### 🔌 System Status")
+
+    try:
+
+        driver = get_neo4j_driver()
+
+        st.success("Neo4j connected ✅")
+
+    except Exception as error:
+
+        st.error("Neo4j not connected ❌")
+        st.caption(str(error))
+
+
+# ============================================================
+# 23. MAIN HEADER
+# ============================================================
+
+st.title("🧠 Chat with your PDF using Graph RAG")
+
+st.subheader(
+    "Upload PDFs → Build Knowledge Graph → Ask Questions"
+)
+
+
+# ============================================================
+# 24. DISPLAY CHAT
+# ============================================================
+
+for message in st.session_state.messages:
+
+    role = message.get("role")
+    content = message.get("content", "")
+
+    if role == "user":
+
+        st.markdown(
+            f"""
+            <div class='user-msg'>
+                <b>You:</b><br>
+                {content}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    else:
+
+        st.markdown(
+            f"""
+            <div class='bot-msg'>
+                <b>Assistant:</b><br>
+                {content}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+# ============================================================
+# 25. CHAT INPUT
+# ============================================================
+
+prompt = st.chat_input(
+    "Ask a question from the PDF knowledge graph"
+)
+
+
+if prompt:
+
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": prompt
+        }
+    )
+
+    try:
+
+        driver = get_neo4j_driver()
+
+        # Check whether any chunks exist
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (c:Chunk) RETURN count(c) AS total"
+            )
+
+            record = result.single()
+            total_chunks = record["total"]
+
+        if total_chunks == 0:
+
+            answer = (
+                "Please upload a PDF and click "
+                "'Build Knowledge Graph' before asking questions."
+            )
+
+            retrieved_chunks = []
+
+        else:
+
+            answer, retrieved_chunks = graph_rag(
+                driver,
+                prompt
+            )
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
+        )
+
+        # ----------------------------------------------------
+        # SHOW RETRIEVED SOURCES
+        # ----------------------------------------------------
+
+        if retrieved_chunks:
+
+            with st.expander(
+                "🔎 View retrieved PDF context"
+            ):
+
+                for chunk in retrieved_chunks:
+
+                    st.markdown(
+                        f"**Document:** "
+                        f"{chunk.get('document_name', 'Unknown')}"
+                    )
+
+                    st.markdown(
+                        f"**Page:** "
+                        f"{chunk.get('page', 'Unknown')}"
+                    )
+
+                    entities = chunk.get("entities", [])
+
+                    if entities:
+                        st.markdown(
+                            f"**Entities:** "
+                            f"{', '.join(entities)}"
+                        )
+
+                    st.markdown("**Text:**")
+                    st.write(chunk.get("text", ""))
+
+                    st.markdown("---")
+
+        save_chat(
+            st.session_state.messages
+        )
+
+    except Exception as error:
+
+        error_message = f"❌ Error: {error}"
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": error_message
+            }
+        )
+
+    st.rerun()
