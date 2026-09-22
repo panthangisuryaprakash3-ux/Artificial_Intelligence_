@@ -1,2 +1,3 @@
-# Data_Analytics
-Projects and learning in Artificial Intelligence, Generative AI, Machine Learning, and Data Analytics.
+# Artificial Intelligence
+
+Projects and learning in Artificial Intelligence, Machine Learning, Generative AI, LLMs, RAG, AI Agents, and related technologies.
